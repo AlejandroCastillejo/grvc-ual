@@ -697,15 +697,17 @@ Velocity BackendDji::velocity() const {
 Odometry BackendDji::odometry() const {}
 
 Transform BackendDji::transform() const {
-    // Transform out;
-    // out.header.stamp = ros::Time::now();
-    // out.header.frame_id = uav_home_frame_id_;
-    // out.child_frame_id = "uav_" + std::to_string(robot_id_);
-    // out.transform.translation.x = cur_pose_.pose.position.x + local_start_pos_[0];
-    // out.transform.translation.y = cur_pose_.pose.position.y + local_start_pos_[1];
-    // out.transform.translation.z = cur_pose_.pose.position.z + local_start_pos_[2];
-    // out.transform.rotation = cur_pose_.pose.orientation;
-    // return out;
+    Transform out;
+    out.header.stamp = ros::Time::now();
+    out.header.frame_id = "map";
+    out.child_frame_id = "uav_" + std::to_string(robot_id_);
+
+    out.transform.translation.x = current_position_.point.x;
+    out.transform.translation.y = current_position_.point.y;
+    out.transform.translation.z = current_position_.point.z;
+    out.transform.rotation = current_attitude_.quaternion;        
+
+    return out;
 }
 
 // bool BackendDji::referencePoseReached() {
