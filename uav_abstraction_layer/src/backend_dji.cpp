@@ -19,26 +19,9 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //----------------------------------------------------------------------------------------------------------------------
 
-// #include <string>
-// #include <chrono>
-#include <uav_abstraction_layer/backend_dji.h>
-// #include <Eigen/Eigen>
-#include <ros/ros.h>
-// #include <cmath>
-#include <dji_sdk/dji_sdk.h>
 
-#include <dji_sdk/Activation.h>
-#include <dji_sdk/SetLocalPosRef.h>
-#include <dji_sdk/SDKControlAuthority.h>
-#include <dji_sdk/DroneTaskControl.h>
-#include <dji_sdk/DroneArmControl.h>
-// #include <std_msgs/UInt8.h>
-// #include <std_msgs/Float64.h>
-#include <sensor_msgs/Joy.h>
-// #include <ros/package.h>
-// #include <tf2_ros/transform_listener.h>
-// #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
-// #include <tf2/LinearMath/Quaternion.h>
+#include <uav_abstraction_layer/backend_dji.h>
+#include <ros/ros.h>
 
 
 geometry_msgs::Pose::_orientation_type q;
@@ -79,38 +62,40 @@ BackendDji::BackendDji()
     // // Init ros communications
     ros::NodeHandle nh;
     std::string dji_ns = "dji_sdk";
-    // std::string set_mode_srv = mavros_ns + "/set_mode";
-    // std::string set_pose_topic = mavros_ns + "/setpoint_position/local";
-    // std::string set_pose_global_topic = mavros_ns + "/setpoint_raw/global";
-    // std::string set_vel_topic = mavros_ns + "/setpoint_velocity/cmd_vel";
-    // std::string pose_topic = mavros_ns + "/local_position/pose";
-    // std::string vel_topic = mavros_ns + "/local_position/velocity";
-    // std::string state_topic = mavros_ns + "/state";
-    // std::string extended_state_topic = mavros_ns + "/extended_state";
+        
+    //ROS services
     std::string activation_srv = dji_ns + "/activation";
     std::string arming_srv = dji_ns + "/drone_arm_control";
     std::string set_local_pos_ref_srv = dji_ns + "/set_local_pos_ref";
     std::string sdk_control_authority_srv = dji_ns + "/sdk_control_authority";
     std::string drone_task_control_srv = dji_ns + "/drone_task_control";
+    std::string mission_waypoint_upload_srv = dji_ns + "/mission_waypoint_upload";
+    std::string mission_waypoint_setSpeed_srv = dji_ns + "/mission_waypoint_setSpeed";
+    std::string mission_waypoint_action_srv = dji_ns + "/mission_waypoint_action";
+
+    // ROS subscribed topics
     std::string get_position_topic = dji_ns + "/local_position";
+    std::string get_linear_velocity_topic = dji_ns + "/velocity";
+    std::string get_angular_velocity_topic = dji_ns + "/angular_velocity_fused";
     std::string get_position_global_topic = dji_ns + "/gps_position";
     std::string get_attitude_topic = dji_ns + "/attitude";
     std::string get_status_topic = dji_ns + "/flight_status";
     std::string get_mode_topic = dji_ns + "/display_mode";
 
-    // std::string flight_control_topic = dji_ns + "/flight_control_setpoint_ENUposition_yaw";
+    std::string get_laser_altitude_topic = "laser_altitude";
+
+    // ROS published topics
     std::string flight_control_topic = dji_ns + "/flight_control_setpoint_generic";
 
-    std::string get_laser_altitude_topic = "laser_altitude";
-    
-     
-
-
+    // ROS services' Clients
     activation_client_ = nh.serviceClient<dji_sdk::Activation>(activation_srv.c_str());
     arming_client_ = nh.serviceClient<dji_sdk::DroneArmControl>(arming_srv.c_str());
     set_local_pos_ref_client_ = nh.serviceClient<dji_sdk::SetLocalPosRef>(set_local_pos_ref_srv.c_str());
     sdk_control_authority_client_ = nh.serviceClient<dji_sdk::SDKControlAuthority>(sdk_control_authority_srv.c_str());
     drone_task_control_client_ = nh.serviceClient<dji_sdk::DroneTaskControl>(drone_task_control_srv.c_str());
+    mission_waypoint_upload_client = nh.serviceClient<dji_sdk::MissionWpUpload>(mission_waypoint_upload_srv.c_str());
+    mission_waypoint_setSpeed_client = nh.serviceClient<dji_sdk::MissionWpSetSpeed>(mission_waypoint_setSpeed_srv.c_str());
+    mission_waypoint_action_client = nh.serviceClient<dji_sdk::MissionWpAction>(mission_waypoint_action_srv.c_str());
 
     flight_control_pub_ = nh.advertise<sensor_msgs::Joy>(flight_control_topic.c_str(), 1);
     // mavros_ref_pose_global_pub_ = nh.advertise<mavros_msgs::GlobalPositionTarget>(set_pose_global_topic.c_str(), 1);
@@ -133,7 +118,7 @@ BackendDji::BackendDji()
 
     position_global_sub_ = nh.subscribe<sensor_msgs::NavSatFix>(get_position_global_topic.c_str(), 1, \
         [this](const sensor_msgs::NavSatFix::ConstPtr& _msg) {
-            this->current_position_global = *_msg;
+            this->current_position_global_ = *_msg;
     });
     
     attitude_sub_ = nh.subscribe<geometry_msgs::QuaternionStamped>(get_attitude_topic.c_str(), 1, \
@@ -144,6 +129,16 @@ BackendDji::BackendDji()
     laser_altitude_sub_ = nh.subscribe<std_msgs::Float64>(get_laser_altitude_topic.c_str(), 1, \
         [this](const std_msgs::Float64::ConstPtr& _msg) {
             this->current_laser_altitude_ = *_msg;
+    });
+
+    linear_velocity_sub_ = nh.subscribe<geometry_msgs::Vector3Stamped>(get_position_topic.c_str(), 1, \
+        [this](const geometry_msgs::Vector3Stamped::ConstPtr& _msg) {
+            this->current_linear_velocity_ = *_msg;
+    });
+
+    angular_velocity_sub_ = nh.subscribe<geometry_msgs::Vector3Stamped>(get_position_topic.c_str(), 1, \
+        [this](const geometry_msgs::Vector3Stamped::ConstPtr& _msg) {
+            this->current_angular_velocity_ = *_msg;
     });
 
     // // TODO: Check this and solve frames issue
@@ -247,8 +242,8 @@ void BackendDji::controlThread() {
                 DJISDK::HORIZONTAL_GROUND |
                 DJISDK::STABLE_ENABLE);
 
-            reference_joy.axes.push_back(100000*(reference_pose_global_.longitude - current_position_global.longitude));
-            reference_joy.axes.push_back(100000*(reference_pose_global_.latitude - current_position_global.latitude));
+            reference_joy.axes.push_back(100000*(reference_pose_global_.longitude - current_position_global_.longitude));
+            reference_joy.axes.push_back(100000*(reference_pose_global_.latitude - current_position_global_.latitude));
             reference_joy.axes.push_back(reference_pose_global_.altitude);
             reference_joy.axes.push_back(yaw);
             reference_joy.axes.push_back(control_flag);
@@ -627,11 +622,44 @@ void BackendDji::goToWaypoint(const Waypoint& _world) {
 }
 
 void	BackendDji::goToWaypointGeo(const WaypointGeo& _wp){
+    std::cout << "test" << std::endl;
+    
+    dji_sdk::MissionWpAction mission_waypoint_action;
+    dji_sdk::MissionWpUpload mission_waypoint_task;
+    std::cout << "test" << std::endl;
+
+    dji_sdk::MissionWaypoint mission_waypoint;
+    std::cout << "test" << std::endl;
+
+    mission_waypoint.latitude = _wp.latitude;
+    mission_waypoint.longitude = _wp.longitude;
+    mission_waypoint.altitude = _wp.altitude;
+
+    mission_waypoint_task.request.waypoint_task.velocity_range = 2.0;
+    mission_waypoint_task.request.waypoint_task.idle_velocity = 1.0;
+    mission_waypoint_task.request.waypoint_task.yaw_mode = 0;
+    mission_waypoint_task.request.waypoint_task.mission_waypoint[0] = mission_waypoint;
+
+    std::cout << "test" << std::endl;
+    mission_waypoint_upload_client.call(mission_waypoint_task);
+    // while (!mission_waypoint_upload_client.call(mission_waypoint_task)) {
+        // std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // }
+    std::cout << "test" << std::endl;
+    
+    mission_waypoint_action.request.action = 0;
+    std::cout << "test" << std::endl;
+
+    mission_waypoint_action_client.call(mission_waypoint_action);
+    std::cout << "test" << std::endl;
+
+    /*
     control_mode_ = eControlMode::GLOBAL_POSE; // Control in position
     
     reference_pose_global_.latitude = _wp.latitude;
     reference_pose_global_.longitude = _wp.longitude;
     reference_pose_global_.altitude = _wp.altitude;
+    */
 
     // // Wait until we arrive: abortable
     // while(!referencePoseReached() && !abort_ && ros::ok()) {
@@ -691,7 +719,12 @@ Pose BackendDji::pose() {
 }
 
 Velocity BackendDji::velocity() const {
-    // return cur_vel_;
+    Velocity out;
+
+    out.twist.linear = current_linear_velocity_.vector;
+    out.twist.angular = current_angular_velocity_.vector;
+
+    return out;
 }
 
 Odometry BackendDji::odometry() const {}
