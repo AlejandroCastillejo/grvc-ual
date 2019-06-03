@@ -26,6 +26,7 @@
 #include <Eigen/Core>
 
 #include <uav_abstraction_layer/backend.h>
+#include <uav_abstraction_layer/pid_controller.h>
 #include <ros/ros.h>
 // #include <ros/package.h>
 // #include <tf2_ros/transform_listener.h>
@@ -173,7 +174,8 @@ public:
     void    recoverFromManual() override;
     /// Set home position
     void    setHome(bool set_z) override;
- 
+    
+
 private:
     void controlThread();
     void setArmed(bool _value);
@@ -190,10 +192,32 @@ private:
     geometry_msgs::PoseStamped reference_pose_;
     double offset_x;
     double offset_y;
+    double offset_z;
     double offset_xy;
 
     double offset_x1;
+    double offset_x2;
     double offset_y1;
+    double offset_y2;
+
+    double error_xy;
+    double error_x;
+    double error_y;
+    double prev_error_x;
+    double prev_error_y;
+    double diff_error_x;
+    double diff_error_y;
+
+    bool active_brake;
+    bool break_flag;
+    double brake_vel_x, brake_vel_y;
+    double brake_dist_x, brake_dist_y;
+
+    float target_xy_vel;
+
+    double velocity_to_command_x = 0;
+    double velocity_to_command_y = 0;
+    //
 
     sensor_msgs::NavSatFix     reference_pose_global_;
     geometry_msgs::TwistStamped reference_vel_;
@@ -214,7 +238,7 @@ private:
     std_msgs::Float64 current_laser_altitude_;
 
     // Control
-    enum class eControlMode { IDLE, LOCAL_VEL, LOCAL_POSE, GLOBAL_POSE };
+    enum class eControlMode { IDLE, LOCAL_VEL, LOCAL_POSE, LOCAL_VEL_POSE, GLOBAL_POSE };
     eControlMode control_mode_ = eControlMode::IDLE;
     // bool mavros_has_pose_ = false;
     float position_th_;
@@ -224,10 +248,12 @@ private:
     bool laser_altimeter;
     bool self_arming;
 
-    float mpc_xy_vel_max;
+    double xy_vel_max;
     float mpc_z_vel_max_up;
     float mpc_z_vel_max_dn;
     float mc_yawrate_max;
+    float aceleration;
+    float deceleration;
 
     DjiHistoryBuffer position_error_;
     DjiHistoryBuffer orientation_error_;
@@ -248,7 +274,8 @@ private:
     ros::Publisher lookahead_pub;
     ros::Publisher ref_pose_pub;
     ros::Publisher offset_y_pub;
-    
+    ros::Publisher velocity_to_command_x_pub;
+    ros::Publisher velocity_to_command_y_pub;
     
     ros::Subscriber position_sub_;
     ros::Subscriber position_global_sub_;
@@ -277,6 +304,7 @@ private:
     bool activated_ = false;
     bool home_set_ = false;
 };
+    
 
 }}	// namespace grvc::ual
 

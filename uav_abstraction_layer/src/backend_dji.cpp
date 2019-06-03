@@ -23,6 +23,7 @@
 #include <uav_abstraction_layer/backend_dji.h>
 #include <Eigen/Eigen>
 #include <ros/ros.h>
+#include <cmath>
 
 
 geometry_msgs::Pose::_orientation_type q;
@@ -34,12 +35,19 @@ double yaw;
 double altitude_offset;
 double alt_1;
 int alt_counter = 0;
+    
+// PID
+double kp = 0.6;
+double ki = 0.01;
+double kd = 0.8;
+grvc::utils::PidController pid_x("pid_x",kp,ki,kd);
+grvc::utils::PidController pid_y("pid_y",kp,ki,kd);
 
 
 namespace grvc { namespace ual {
 
 BackendDji::BackendDji()
-    : Backend()
+    : Backend() 
 {
     // Parse arguments
     ros::NodeHandle pnh("~");
@@ -52,16 +60,25 @@ BackendDji::BackendDji()
     orientation_th_ = 0.5*(1 - cos(orientation_th_param));
 
     float vel_factor_param;
-    pnh.param<float>("vel_factor", vel_factor_param, 0.7);
+    pnh.param<float>("vel_factor", vel_factor_param, 0.5);
     vel_factor_max = vel_factor_param;
     
     pnh.param<bool>("laser_altimeter", laser_altimeter, false);
     pnh.param<bool>("self_arming", self_arming, false);
 
-    pnh.param<float>("xy_vel_max", mpc_xy_vel_max, 3.0);
+    double xy_vel_max_param;
+    pnh.param<double>("xy_vel_max", xy_vel_max_param, 5.0);
+    xy_vel_max = xy_vel_max_param;
     pnh.param<float>("z_vel_max_up", mpc_z_vel_max_up, 2.0);
     pnh.param<float>("z_vel_max_dn", mpc_z_vel_max_dn, 2.0);
     pnh.param<float>("yawrate_max", mc_yawrate_max, 0.8);
+
+    float aceleration_param;
+    float deceleration_param;
+    pnh.param<float>("aceleration", aceleration_param, 0.3);
+    pnh.param<float>("deceleration", deceleration_param, 0.3);
+    aceleration = aceleration_param;
+    deceleration = deceleration_param;
 
     ROS_INFO("BackendDji constructor with id %d",robot_id_);
     // ROS_INFO("BackendDji: thresholds = %f %f", position_th_, orientation_th_);
@@ -107,10 +124,11 @@ BackendDji::BackendDji()
     flight_control_pub_ = nh.advertise<sensor_msgs::Joy>(flight_control_topic.c_str(), 1);
     // mavros_ref_pose_global_pub_ = nh.advertise<mavros_msgs::GlobalPositionTarget>(set_pose_global_topic.c_str(), 1);
     
-
     //test publishers
     lookahead_pub = nh.advertise<std_msgs::Float64>("lookahead", 1);
     offset_y_pub = nh.advertise<std_msgs::Float64>("offset_y", 1);
+    velocity_to_command_x_pub = nh.advertise<std_msgs::Float64>("velocity_to_command_x", 1);
+    velocity_to_command_y_pub = nh.advertise<std_msgs::Float64>("velocity_to_command_y", 1);
     ref_pose_pub = nh.advertise<geometry_msgs::PoseStamped>("ref_pose_y", 1);
     ///
 
@@ -162,7 +180,7 @@ BackendDji::BackendDji()
     // // Wait until we have pose
     // while (!mavros_has_pose_ && ros::ok()) {
     //     // ROS_INFO("BackendDji: Waiting for pose");
-    //     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    //     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     // }
     // initHomeFrame();
 
@@ -177,7 +195,7 @@ BackendDji::BackendDji()
 }
 
 void BackendDji::controlThread() {
-    ros::param::param<double>("~dji_offboard_rate", control_thread_frequency_, 30.0);
+    ros::param::param<double>("~dji_offboard_rate", control_thread_frequency_, 40.0);
     double hold_pose_time = 3.0;  // [s]  TODO param?
     int buffer_size = std::ceil(hold_pose_time * control_thread_frequency_);
     position_error_.set_size(buffer_size);
@@ -186,6 +204,8 @@ void BackendDji::controlThread() {
 
     //test
     std_msgs::Float64 offset_y_;
+    std_msgs::Float64 velocity_to_command_x_;
+    std_msgs::Float64 velocity_to_command_y_;
 
     while (ros::ok()) {
         sensor_msgs::Joy reference_joy;
@@ -194,7 +214,7 @@ void BackendDji::controlThread() {
         switch(control_mode_) {
         case eControlMode::IDLE:
             break;
-        case eControlMode::LOCAL_VEL:
+        case eControlMode::LOCAL_VEL:       // Horizontal & Vertical Velocity
 
             control_flag = (DJISDK::HORIZONTAL_VELOCITY |
                 DJISDK::VERTICAL_VELOCITY       |
@@ -217,7 +237,7 @@ void BackendDji::controlThread() {
             // ref_pose_ = cur_pose_;
             break;
 
-        case eControlMode::LOCAL_POSE: 
+        case eControlMode::LOCAL_POSE:      // Horizontal & Vertical Position
                         
             BackendDji::Quaternion2EulerAngle(q, roll, pitch, yaw);
              
@@ -226,18 +246,134 @@ void BackendDji::controlThread() {
                 DJISDK::YAW_ANGLE            |
                 DJISDK::HORIZONTAL_GROUND |
                 DJISDK::STABLE_ENABLE);
-            //flag = (0x80 | 0x10 | 0x00 | 0x02 | 0x01);
 
             offset_x = reference_pose_.pose.position.x - current_position_.point.x;
             offset_y = reference_pose_.pose.position.y - current_position_.point.y;
-            offset_xy = sqrt(offset_x*offset_x + offset_y*offset_y);
-            offset_x1 = offset_x / offset_xy * std::min(10.0, offset_xy);
-            offset_y1 = offset_y / offset_xy * std::min(10.0, offset_xy);
-            reference_joy.axes.push_back(vel_factor * offset_x1);
-            reference_joy.axes.push_back(vel_factor * offset_y1);
+            // offset_z = reference_pose_.pose.position.z - current_position_.point.z;
+            // offset_xy = sqrt(offset_x*offset_x + offset_y*offset_y);
+            // offset_x1 = offset_x / offset_xy * std::min(10.0, offset_xy);
+            // offset_y1 = offset_y / offset_xy * std::min(10.0, offset_xy);
+            reference_joy.axes.push_back(offset_x);
+            reference_joy.axes.push_back(offset_y);
             
             //test
             offset_y_.data = offset_y;
+            offset_y_pub.publish(offset_y_);
+            ref_pose_pub.publish(reference_pose_);
+            ///
+
+            // if (laser_altimeter == true) {
+            //     // ROS_INFO("laser alt on: %s", laser_altimeter ? "true":"false");
+            //     if ( current_laser_altitude_.data == 0.0 || altimeter_fail() ) {
+            //         reference_joy.axes.push_back(reference_pose_.pose.position.z);
+            //     }   
+            //     else {
+            //         altitude_offset = reference_pose_.pose.position.z - current_laser_altitude_.data;
+            //         reference_joy.axes.push_back(current_position_.point.z + 2*altitude_offset);
+            //     }
+            // } else {
+            //     reference_joy.axes.push_back(reference_pose_.pose.position.z);
+            // }
+            if (laser_altimeter == true && current_laser_altitude_.data != 0.0 && !altimeter_fail()) {
+                altitude_offset = reference_pose_.pose.position.z - current_laser_altitude_.data;
+                reference_joy.axes.push_back(current_position_.point.z + 2*altitude_offset);
+            } else {
+                reference_joy.axes.push_back(reference_pose_.pose.position.z);
+            }
+
+            reference_joy.axes.push_back(yaw);
+            reference_joy.axes.push_back(control_flag);
+
+            flight_control_pub_.publish(reference_joy);
+
+            break;          
+
+        case eControlMode::LOCAL_VEL_POSE:      // Horizontal_Velocity & Vertical_Position
+            
+            BackendDji::Quaternion2EulerAngle(q, roll, pitch, yaw);
+
+            control_flag = (DJISDK::HORIZONTAL_VELOCITY |
+                DJISDK::VERTICAL_POSITION       |
+                DJISDK::YAW_ANGLE            |
+                DJISDK::HORIZONTAL_GROUND |
+                DJISDK::STABLE_ENABLE);
+            
+            offset_x = reference_pose_.pose.position.x - current_position_.point.x;
+            offset_y = reference_pose_.pose.position.y - current_position_.point.y;
+
+            // std::cout << "offset_y: " << offset_y << std::endl;
+
+            // error_x = reference_pose_.pose.position.x - current_position_.point.x;
+            // error_y = reference_pose_.pose.position.y - current_position_.point.y;
+ 
+            offset_xy = sqrt(offset_x*offset_x + offset_y*offset_y);
+            
+            // if (prev_error_x == 0) {
+            //     diff_error_x = 0;
+            // } else {
+            //     diff_error_x = error_x - prev_error_x;
+            // }
+            // prev_error_x = error_x;
+
+            // if (prev_error_y == 0) {
+            //     diff_error_y = 0;
+            // } else {
+            //     diff_error_y = error_y - prev_error_y;
+            // }
+            // prev_error_y = error_y;
+            // std::cout << "diff_error_y: " << diff_error_y << std::endl;
+
+            if (!active_brake) {
+                offset_x1 = vel_factor * offset_x / (offset_xy) * std::min(xy_vel_max, offset_xy);
+                offset_y1 = vel_factor * offset_y / (offset_xy) * std::min(xy_vel_max, offset_xy);
+                // offset_x1 = target_xy_vel * offset_x/offset_xy;
+                // offset_y1 = target_xy_vel * offset_y/offset_xy;
+            } else {
+                // offset_x1 = vel_factor * offset_x / (offset_xy);
+                // offset_y1 = vel_factor * offset_y / (offset_xy);
+                offset_x1 = sqrt(abs(2*deceleration * offset_x)) * offset_x / abs(offset_x);
+                offset_y1 = sqrt(abs(2*deceleration * offset_y)) * offset_y / abs(offset_y);
+            }
+            // std::cout << "vel_command_x  " << offset_x1 << std::endl;
+            // std::cout << "vel_command_y  " << offset_y1 << std::endl;
+            
+            // offset_x1 = target_xy_vel * offset_x/offset_xy;
+            // offset_y1 = target_xy_vel * offset_y/offset_xy;
+
+
+
+            // reference_joy.axes.push_back(velocity_to_command_x);
+            // reference_joy.axes.push_back(velocity_to_command_y);
+
+
+            offset_x1 = vel_factor * offset_x / (offset_xy) * std::min(xy_vel_max, offset_xy);
+            offset_y1 = vel_factor * offset_y / (offset_xy) * std::min(xy_vel_max, offset_xy);
+            
+            offset_x2 = pid_x.control_signal(offset_x1, 1.0/30.0); //30 Hz
+            offset_y2 = pid_y.control_signal(offset_y1, 1.0/30.0); //30 Hz
+
+            if (offset_x2 > velocity_to_command_x) {velocity_to_command_x += 0.05;}
+            else if (offset_x2 < velocity_to_command_x) {velocity_to_command_x -= 0.05;}
+            if (offset_y2 > velocity_to_command_y) {velocity_to_command_y += 0.05;}
+            else if (offset_y2 < velocity_to_command_y) {velocity_to_command_y -= 0.05;}
+              
+            // std::cout << "vel_command_x  " << velocity_to_command_x << std::endl;
+            // std::cout << "vel_command_y  " << velocity_to_command_y << std::endl;
+    
+            reference_joy.axes.push_back(velocity_to_command_x);
+            reference_joy.axes.push_back(velocity_to_command_y);
+
+
+
+            // reference_joy.axes.push_back(vel_factor * offset_z);
+
+            //test
+            offset_y_.data = offset_y2;
+            // velocity_to_command_y_.data = velocity_to_command_y;
+            velocity_to_command_x_.data = velocity_to_command_x;
+            velocity_to_command_y_.data = velocity_to_command_y;
+            velocity_to_command_x_pub.publish(velocity_to_command_x_);
+            velocity_to_command_y_pub.publish(velocity_to_command_y_);
             offset_y_pub.publish(offset_y_);
             ref_pose_pub.publish(reference_pose_);
             ///
@@ -264,6 +400,7 @@ void BackendDji::controlThread() {
             // std::cout << current_laser_altitude_ << std::endl;
 
             break; 
+
         case eControlMode::GLOBAL_POSE:
 
             control_flag = (DJISDK::HORIZONTAL_POSITION |
@@ -633,9 +770,13 @@ PurePursuitOutput DjiPurePursuit(geometry_msgs::Point _current, geometry_msgs::P
 }
 
 void BackendDji::goToWaypoint(const Waypoint& _world) {
-    control_mode_ = eControlMode::LOCAL_POSE;    // Control in position
+    control_mode_ = eControlMode::LOCAL_VEL_POSE;    // Control in vertical_velocity & horizontal_position
 
-    vel_factor = 0.001;
+    // vel_factor = 0.005;
+    prev_error_x = 0;
+    prev_error_y = 0;
+    vel_factor = vel_factor_max;
+
 
     reference_pose_ = _world;
     q.x = reference_pose_.pose.orientation.x;
@@ -648,32 +789,7 @@ void BackendDji::goToWaypoint(const Waypoint& _world) {
     // No transform is needed
     homogen_world_pos = _world;
 
-    // tf2_ros::Buffer tfBuffer;
-    // tf2_ros::TransformListener tfListener(tfBuffer);
-    // std::string waypoint_frame_id = tf2::getFrameId(_world);
-
-    // if ( waypoint_frame_id == "" || waypoint_frame_id == uav_home_frame_id_ ) {
-    //     // No transform is needed
-    //     homogen_world_pos = _world;
-    // }
-    // else {
-    //     // We need to transform
-    //     geometry_msgs::TransformStamped transformToHomeFrame;
-
-    //     if ( cached_transforms_.find(waypoint_frame_id) == cached_transforms_.end() ) {
-    //         // waypoint_frame_id not found in cached_transforms_
-    //         transformToHomeFrame = tfBuffer.lookupTransform(uav_home_frame_id_, waypoint_frame_id, ros::Time(0), ros::Duration(1.0));
-    //         cached_transforms_[waypoint_frame_id] = transformToHomeFrame; // Save transform in cache
-    //     } else {
-    //         // found in cache
-    //         transformToHomeFrame = cached_transforms_[waypoint_frame_id];
-    //     }
-        
-    //     tf2::doTransform(_world, homogen_world_pos, transformToHomeFrame);
-        
-    // }
-
-//    std::cout << "Going to waypoint: " << homogen_world_pos.pose.position << std::endl;
+   std::cout << "Going to waypoint: " << homogen_world_pos.pose.position << std::endl;
 
     // // Do we still need local_start_pos_?
     // homogen_world_pos.pose.position.x -= local_start_pos_[0];
@@ -694,73 +810,122 @@ void BackendDji::goToWaypoint(const Waypoint& _world) {
 
     float linear_distance  = sqrt(ab_x*ab_x + ab_y*ab_y + ab_z*ab_z);
     float linear_threshold = sqrt(position_th_);
+    // float linear_threshold = 0;
     if (linear_distance > linear_threshold) {
-        // float mpc_xy_vel_max   = updateParam("MPC_XY_VEL_MAX");
-        // float mpc_z_vel_max_up = updateParam("MPC_Z_VEL_MAX_UP");
-        // float mpc_z_vel_max_dn = updateParam("MPC_Z_VEL_MAX_DN");
-        // float mc_yawrate_max   = updateParam("MC_YAWRATE_MAX");
+        // float xy_vel_max   = updateParam("MPC_XY_VEL_MAX");
 
         float mpc_z_vel_max = (ab_z > 0)? mpc_z_vel_max_up : mpc_z_vel_max_dn;
         float xy_distance = sqrt(ab_x*ab_x + ab_y*ab_y);
         float z_distance = fabs(ab_z);
-        bool z_vel_is_limit = (mpc_z_vel_max*xy_distance < mpc_xy_vel_max*z_distance);
+        bool z_vel_is_limit = (mpc_z_vel_max*xy_distance < xy_vel_max*z_distance);
 
-        ros::Rate rate(30);  // [Hz]
+        ros::Rate rate(60);  // [Hz]
         float next_to_final_distance = linear_distance;
         float lookahead = 0.05;
         float error_xy_vel;
-        
+
+        active_brake = false;
+        break_flag = false;
+
+
         //test
         std_msgs::Float64 msg_lookahead;
         ///
-
         
+        target_xy_vel = 0.01;
+   
         while (next_to_final_distance > linear_threshold && !abort_ && ros::ok()) {
-            float current_xy_vel = sqrt(cur_vel_.twist.linear.x*cur_vel_.twist.linear.x + cur_vel_.twist.linear.y*cur_vel_.twist.linear.y);
-            float current_z_vel = fabs(cur_vel_.twist.linear.z);
-            // if (z_vel_is_limit) {
-            //     if (current_z_vel > 1.0*mpc_z_vel_max) { lookahead -= 0.05; }  // TODO: Other thesholds, other update politics?
-            //     if (current_z_vel < 0.95*mpc_z_vel_max) { lookahead += 0.05; }  // TODO: Other thesholds, other update politics?
-            //     // ROS_INFO("current_z_vel = %f", current_z_vel);
-            // } else {
-            //     // if (current_xy_vel > 1.0*mpc_xy_vel_max) { lookahead -= 0.05; }  // TODO: Other thesholds, other update politics?
-            //     // if (current_xy_vel < 0.95*mpc_xy_vel_max) { lookahead += 0.05; }  // TODO: Other thesholds, other update politics?
-            //     error_xy_vel = mpc_xy_vel_max - current_xy_vel;
-            //     lookahead += 0.05*error_xy_vel;
-            //     // ROS_INFO("current_xy_vel = %f", current_xy_vel);
-            // }
+        // while (!abort_ && ros::ok()) {
+        //     float current_xy_vel = sqrt(cur_vel_.twist.linear.x*cur_vel_.twist.linear.x + cur_vel_.twist.linear.y*cur_vel_.twist.linear.y);
+        //     float current_z_vel = fabs(cur_vel_.twist.linear.z);
+            
+        //     if (z_vel_is_limit) {
+        //         if (current_z_vel > 1.0*mpc_z_vel_max) { lookahead -= 0.05; }  // TODO: Other thesholds, other update politics?
+        //         if (current_z_vel < 0.95*mpc_z_vel_max) { lookahead += 0.05; }  // TODO: Other thesholds, other update politics?
+        //         // ROS_INFO("current_z_vel = %f", current_z_vel);
+        //     } else {
+        //         if (current_xy_vel > 1.05*xy_vel_max) { lookahead -= 0.05; }  // TODO: Other thesholds, other update politics?
+        //         if (current_xy_vel < 0.95*xy_vel_max) { lookahead += 0.05; }  // TODO: Other thesholds, other update politics?
+        //         // error_xy_vel = xy_vel_max - current_xy_vel;
+        //         // lookahead += 0.02*error_xy_vel;
+        //         // ROS_INFO("current_xy_vel = %f", current_xy_vel);
+        //     }
 
-            error_xy_vel = mpc_xy_vel_max - current_xy_vel;
-            if (error_xy_vel > 0 && vel_factor < vel_factor_max) {
-                vel_factor += 0.003;
-                // vel_factor += 0.0025*error_xy_vel;
-            } else if (error_xy_vel < 0.2) {
-                // vel_factor -= 0.001;
+        //     PurePursuitOutput pp = DjiPurePursuit(cur_pose_.pose.position, initial_position, final_position, lookahead);
+        //     Waypoint wp_i;
+        //     wp_i.pose.position.x = pp.next.x;
+        //     wp_i.pose.position.y = pp.next.y;
+        //     wp_i.pose.position.z = pp.next.z;
+        //     Eigen::Quaterniond q_i = initial_orientation.slerp(pp.t_lookahead, final_orientation);
+        //     wp_i.pose.orientation.w = q_i.w();
+        //     wp_i.pose.orientation.x = q_i.x();
+        //     wp_i.pose.orientation.y = q_i.y();
+        //     wp_i.pose.orientation.z = q_i.z();
+        //     reference_pose_.pose = wp_i.pose;
+        //     next_to_final_distance = (1.0 - pp.t_lookahead) * linear_distance;
+        //     // ROS_INFO("next_to_final_distance = %f", next_to_final_distance);
+                ab_x = final_position.x - cur_pose_.pose.position.x;
+                ab_y = final_position.y - cur_pose_.pose.position.y;
+                next_to_final_distance = sqrt(ab_x*ab_x + ab_y*ab_y);
+                std::cout << "to final distance" << next_to_final_distance << std::endl;
+
+        //     //test
+        //     msg_lookahead.data = lookahead;
+        //     lookahead_pub.publish(msg_lookahead);
+            
+            double current_xy_vel = sqrt(cur_vel_.twist.linear.x*cur_vel_.twist.linear.x + cur_vel_.twist.linear.y*cur_vel_.twist.linear.y);
+            // if (current_xy_vel*current_xy_vel / next_to_final_distance > 2*deceleration && break_flag && !active_brake) {
+            if (current_xy_vel*current_xy_vel / next_to_final_distance > 2*deceleration && !active_brake) {
+                active_brake = true;
+                vel_factor = current_xy_vel;
+                brake_dist_x = fabs(final_position.x - cur_pose_.pose.position.x);
+                brake_dist_y = fabs(final_position.y - cur_pose_.pose.position.y);
+                brake_vel_x = fabs(cur_vel_.twist.linear.x);
+                brake_vel_x = fabs(cur_vel_.twist.linear.x);
+            }
+           
+            // if (current_xy_vel*current_xy_vel / next_to_final_distance > 2*deceleration && !break_flag && !active_brake) {break_flag = true;}
+
+            float deceleration = current_xy_vel*current_xy_vel / (2*brake_dist_y);
+            if (target_xy_vel < xy_vel_max && !active_brake) {
+                // target_xy_vel += 0.001;
+                target_xy_vel += aceleration/30.0;
+            } else if (active_brake) {
+                // target_xy_vel -= 0.001;
+                target_xy_vel -= deceleration/30.0;
             }
 
+            // error_xy_vel = xy_vel_max - current_xy_vel;
+            // if (fabs(error_xy_vel) > 0 && vel_factor < vel_factor_max && !active_brake) {
+            // // if (error_xy_vel > 0 ) {
+            //     vel_factor += 0.002;
+            //     // vel_factor += 0.0025*error_xy_vel;
+            // } else if (error_xy_vel < 0.2) {
+            //     vel_factor -= 0.001;
+            // } else if (active_brake && vel_factor > 0.1) {
+            //     // vel_factor -= 0.001;
+            // }
+            error_xy_vel = fabs(target_xy_vel - current_xy_vel);
+            if (error_xy_vel > 0 && vel_factor < vel_factor_max ) {
+                vel_factor += 0.01;
+            } else if (error_xy_vel < 0.1 && vel_factor > 0) {
+                // vel_factor -= 0.01;
+            }
+            
+            std::cout << "current_xy_vel² / next_to_final_distance =  " << current_xy_vel*current_xy_vel / next_to_final_distance << std::endl;
+            std::cout << "active_brake: "<< active_brake << std::endl;  
+            std::cout << "vel_factor: "<< vel_factor << std::endl;
+            // std::cout << "error_xy_vel: "<< error_xy_vel << std::endl;
+            // std::cout << "current_xy_vel: "<< current_xy_vel << std::endl;
 
-
-            // PurePursuitOutput pp = DjiPurePursuit(cur_pose_.pose.position, initial_position, final_position, lookahead);
-            // Waypoint wp_i;
-            // wp_i.pose.position.x = pp.next.x;
-            // wp_i.pose.position.y = pp.next.y;
-            // wp_i.pose.position.z = pp.next.z;
-            // Eigen::Quaterniond q_i = initial_orientation.slerp(pp.t_lookahead, final_orientation);
-            // wp_i.pose.orientation.w = q_i.w();
-            // wp_i.pose.orientation.x = q_i.x();
-            // wp_i.pose.orientation.y = q_i.y();
-            // wp_i.pose.orientation.z = q_i.z();
-            // reference_pose_.pose = wp_i.pose;
-            // next_to_final_distance = (1.0 - pp.t_lookahead) * linear_distance;
-            // // ROS_INFO("next_to_final_distance = %f", next_to_final_distance);
-
-            // //test
-            // msg_lookahead.data = lookahead;
-            // lookahead_pub.publish(msg_lookahead);
-            // ///
 
             rate.sleep();
         }
+        
+        // control_mode_ = eControlMode::IDLE;    
+        // std::cout << "control_mode_ = eControlMode::IDLE" << std::endl;
+
+
     }
     // ROS_INFO("All points sent!");
 
