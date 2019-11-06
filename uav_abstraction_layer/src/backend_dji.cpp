@@ -901,6 +901,7 @@ void	BackendDji::goToWaypointGeo(const WaypointGeo& _wp){
 Pose BackendDji::pose() {
         Pose out;
 
+        out.header.frame_id = "map";
         out.pose.position.x = current_position_.point.x;
         out.pose.position.y = current_position_.point.y;
         if (laser_altimeter == true && current_laser_altitude_.data != 0.0 && !altimeter_fail() ) {
